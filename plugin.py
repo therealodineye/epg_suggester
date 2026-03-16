@@ -19,6 +19,7 @@ _COUNTRY_CODES = {
 
 # Short common words to exclude from the word index (too many false hits)
 _STOP_WORDS = {'hd','sd','tv','the','and','for','live','news','channel','network'}
+_CALLSIGN_RE = _re.compile(r'\(([A-Z]{2,5}(?:-[A-Z0-9]+)?)\)')
 
 
 class Plugin:
@@ -84,15 +85,9 @@ class Plugin:
         return min(99, overlap_s + sub)
 
     def _build_index(self, epg_entries, cfg):
-        """
-        Build:
-          by_country  : {country_code: [entry, ...]}
-          word_index  : {word: [entry, ...]}  — for no-prefix entries only
-          no_country  : [entry, ...]          — all no-prefix entries (for fallback)
-        """
         by_country = {}
         no_country = []
-        word_index = {}   # inverted index for fast candidate lookup
+        word_index = {}
 
         for e in epg_entries:
             raw = (e["name"] or "").strip()
@@ -101,26 +96,39 @@ class Plugin:
             norm = self._norm(raw, cfg)
             tok  = norm.split()
             tset = set(tok)
+            # Extract callsign from EPG display name: "KSDK-DT" -> "KSDK"
+            raw_upper = raw.strip().upper()
+            cs_match = _re.match(r'^([A-Z]{2,5})(?:[-.]|$)', raw_upper)
+            epg_callsign = cs_match.group(1) if cs_match and _re.match(r'^[A-Z]{2,5}$', cs_match.group(1)) else ''
             entry = {
-                "id":     e["id"],
-                "name":   raw,
-                "tvg_id": e["tvg_id"] or "",
-                "source": e["epg_source__name"] or "",
-                "norm":   norm,
-                "tok":    tok,
-                "tset":   tset,
+                "id":           e["id"],
+                "name":         raw,
+                "tvg_id":       e["tvg_id"] or "",
+                "source":       e["epg_source__name"] or "",
+                "norm":         norm,
+                "tok":          tok,
+                "tset":         tset,
+                "epg_callsign": epg_callsign,
             }
             m = _CTRY_RE.match(norm)
             if m:
                 by_country.setdefault(m.group(1), []).append(entry)
             else:
                 no_country.append(entry)
-                # Index meaningful words
                 for word in tset:
                     if len(word) >= 3 and word not in _STOP_WORDS:
                         word_index.setdefault(word, []).append(entry)
 
-        return by_country, no_country, word_index
+        # Build callsign index from raw EPG names
+        callsign_index = {}
+        for entries in [no_country] + list(by_country.values()):
+            for entry in entries:
+                cs = entry.get("epg_callsign", "")
+                if cs:
+                    callsign_index.setdefault(cs, []).append(entry)
+
+        return by_country, no_country, word_index, callsign_index
+
 
     def _candidates_for(self, ch_norm, ch_tok, ch_set, by_country, no_country, word_index):
         """Return candidate EPG entries for this channel using word-index for no-prefix entries."""
@@ -159,18 +167,40 @@ class Plugin:
 
         return country_entries + nc_candidates
 
-    def _suggest(self, ch_norm, by_country, no_country, word_index, cfg):
+    def _suggest(self, ch_norm, ch_raw, by_country, no_country, word_index, callsign_index, cfg):
         ct    = ch_norm.split()
         cs    = set(ct)
         min_s = cfg["min_s"]
 
+        # Extract callsign from raw channel name e.g. "PRIME: NBC ST LOUIS (KSDK) RAW"
+        ch_callsign = ''
+        cm = _CALLSIGN_RE.search(ch_raw)
+        if cm:
+            ch_callsign = cm.group(1).upper()
+            # Also strip -DT/-CD suffixes for comparison
+            ch_callsign = _re.sub(r'[-.].*$', '', ch_callsign)
+
         candidates = self._candidates_for(ch_norm, ct, cs, by_country, no_country, word_index)
 
+        # Callsign direct lookup - O(1) using pre-built index
+        if ch_callsign:
+            cs_hits = callsign_index.get(ch_callsign, [])
+            candidates = candidates + cs_hits
+
         scored = []
+        seen_ids = set()
         for e in candidates:
-            s = self._fast_score(ct, cs, ch_norm, e["tok"], e["tset"], e["norm"], min_s)
-            if s >= min_s:
-                scored.append((s, e))
+            eid = e["id"]
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            # Callsign exact match = score 100
+            if ch_callsign and e.get("epg_callsign") == ch_callsign:
+                scored.append((100, e))
+            else:
+                s = self._fast_score(ct, cs, ch_norm, e["tok"], e["tset"], e["norm"], min_s)
+                if s >= min_s:
+                    scored.append((s, e))
         scored.sort(key=lambda x: x[0], reverse=True)
 
         # Deduplicate by id
@@ -204,14 +234,14 @@ class Plugin:
     def _run_matching(self, cfg, log):
         channels               = self._get_channels(cfg, log)
         epg_raw                = self._get_epg(cfg, log)
-        by_country, no_country, word_index = self._build_index(epg_raw, cfg)
-        log.info("EPG Suggester: index built (%d country groups, %d no-prefix, %d word-index keys)",
-                 len(by_country), len(no_country), len(word_index))
+        by_country, no_country, word_index, callsign_index = self._build_index(epg_raw, cfg)
+        log.info("EPG Suggester: index built (%d country groups, %d no-prefix, %d word-index keys, %d callsigns)",
+                 len(by_country), len(no_country), len(word_index), len(callsign_index))
         results = []
         for ch in channels:
             raw  = ch["name"] or ""
             norm = self._norm(raw, cfg)
-            sugg = self._suggest(norm, by_country, no_country, word_index, cfg)
+            sugg = self._suggest(norm, raw, by_country, no_country, word_index, callsign_index, cfg)
             results.append({
                 "channel_id":    ch["id"],
                 "channel_name":  raw,
