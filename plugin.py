@@ -1,8 +1,12 @@
 import re as _re
 
-_CTRY_RE = _re.compile(r'^([a-z]{2,5}): ')
+_CTRY_RE    = _re.compile(r'^([a-z]{2,5}): ')
+_PREFIX_RE  = _re.compile(r'^([A-Za-z]{2,5})\s*[|\-:]\s*')
+_UNICODE_RE = _re.compile(r'[\u1d00-\u1dbf\u2c60-\u2c7f\u2070-\u209f\u00b2-\u00b3\u00b9]+')
+_QUALITY_RE = _re.compile(r'\b(?:4k|uhd|fhd|hd|sd|hevc|h265|h264|hdr|sdr|1080[pi]?|720[pi]?)\b', _re.IGNORECASE)
+_MISC_RE    = _re.compile(r'\b(?:vip|backup\d*|bkup|plus|premium|extra|alt|raw|\+1|\+2)\b|\([^)]{0,15}\)|\[[^\]]{0,15}\]|\s*\*+\s*', _re.IGNORECASE)
+_WS_RE      = _re.compile(r'\s+')
 
-# Known ISO-3166 country codes - prefixes matching these are kept, others stripped
 _COUNTRY_CODES = {
     'us','uk','gb','au','ca','de','fr','it','es','nl','be','ch','at',
     'no','se','dk','fi','pl','pt','ro','al','sr','hr','si','sk','cz',
@@ -13,35 +17,27 @@ _COUNTRY_CODES = {
     'ke','gh','tz','et','cm','ci','sn','rw','ug','ao','mz','ru','cl',
 }
 
-_UNICODE_RE = _re.compile(r'[\u1d00-\u1dbf\u2c60-\u2c7f\u2070-\u209f\u00b2-\u00b3\u00b9]+')
-_QUALITY_RE = _re.compile(r'\b(?:4k|uhd|fhd|hd|sd|hevc|h265|h264|hdr|sdr|1080[pi]?|720[pi]?)\b', _re.IGNORECASE)
-_MISC_RE    = _re.compile(r'\b(?:vip|backup\d*|bkup|plus|premium|extra|alt|raw|\+1|\+2)\b|\([^)]{0,15}\)|\[[^\]]{0,15}\]|\s*\*+\s*', _re.IGNORECASE)
-_WS_RE      = _re.compile(r'\s+')
-_PREFIX_RE  = _re.compile(r'^([A-Za-z]{2,5})\s*[|\-:]\s*')
+# Short common words to exclude from the word index (too many false hits)
+_STOP_WORDS = {'hd','sd','tv','the','and','for','live','news','channel','network'}
 
 
 class Plugin:
-    name = "EPG Suggester"
-    version = "2.0.0"
+    name        = "EPG Suggester"
+    version     = "2.2.0"
     description = "Suggests EPG entries for channels without EPG assigned, using fuzzy name matching."
 
     def run(self, action, params, context):
         import logging
-        log = logging.getLogger("plugins.epg_suggester")
+        log      = logging.getLogger("plugins.epg_suggester")
         settings = context.get("settings", {})
-        cfg = self._parse_settings(settings)
+        cfg      = self._parse_settings(settings)
         log.info("EPG Suggester: action=%s", action)
 
-        if action == "show_unmatched":
-            return self._show_unmatched(cfg, log)
-        elif action == "scan_and_suggest":
-            return self._scan(cfg, log)
-        elif action == "export_suggestions_csv":
-            return self._export(cfg, log)
-        elif action == "apply_suggestions":
-            return self._apply(cfg, log)
-        else:
-            return {"status": "error", "message": "Unknown action: " + action}
+        if action == "show_unmatched":      return self._show_unmatched(cfg, log)
+        elif action == "scan_and_suggest":  return self._scan(cfg, log)
+        elif action == "export_suggestions_csv": return self._export(cfg, log)
+        elif action == "apply_suggestions": return self._apply(cfg, log)
+        else: return {"status": "error", "message": "Unknown action: " + action}
 
     def _parse_settings(self, settings):
         return {
@@ -62,43 +58,42 @@ class Plugin:
         m = _PREFIX_RE.match(n)
         if m:
             prefix = m.group(1).lower()
-            rest = n[m.end():]
+            rest   = n[m.end():]
             n = (prefix + ': ' + rest) if prefix in _COUNTRY_CODES else rest
-        if cfg["qual"]:
-            n = _QUALITY_RE.sub(' ', n)
-        if cfg["misc"]:
-            n = _MISC_RE.sub(' ', n)
+        if cfg["qual"]: n = _QUALITY_RE.sub(' ', n)
+        if cfg["misc"]: n = _MISC_RE.sub(' ', n)
         return _WS_RE.sub(' ', n).strip().lower()
 
     @staticmethod
     def _fast_score(ct, cs, cn, et, es, en, min_s):
         import difflib
         if cn == en: return 100
-        # Number guard: channels with different numbers are different channels
-        # e.g. "history 2" should NOT match "history 1"
         ch_nums = set(t for t in ct if t.isdigit())
         ep_nums = set(t for t in et if t.isdigit())
         if ch_nums and ep_nums and not (ch_nums & ep_nums):
             return 0
-        inter = len(cs & es) if cs and es else 0
-        union = max(len(cs), len(es)) if (cs or es) else 1
+        inter     = len(cs & es) if cs and es else 0
+        union     = max(len(cs), len(es)) if (cs or es) else 1
         overlap_s = int(inter / union * 90)
-        sub = 20 if (cn in en or en in cn) else 0
+        sub       = 20 if (cn in en or en in cn) else 0
         if overlap_s + sub < min_s:
             return overlap_s + sub
         if overlap_s >= 40 or sub:
-            ratio = difflib.SequenceMatcher(
-                None,
-                ' '.join(sorted(ct)),
-                ' '.join(sorted(et))
-            ).ratio()
+            ratio     = difflib.SequenceMatcher(None, ' '.join(sorted(ct)), ' '.join(sorted(et))).ratio()
             overlap_s = max(overlap_s, int(ratio * 90))
         return min(99, overlap_s + sub)
 
     def _build_index(self, epg_entries, cfg):
-        """Pre-tokenise all EPG entries and group by country prefix for fast lookup."""
+        """
+        Build:
+          by_country  : {country_code: [entry, ...]}
+          word_index  : {word: [entry, ...]}  — for no-prefix entries only
+          no_country  : [entry, ...]          — all no-prefix entries (for fallback)
+        """
         by_country = {}
         no_country = []
+        word_index = {}   # inverted index for fast candidate lookup
+
         for e in epg_entries:
             raw = (e["name"] or "").strip()
             if not raw:
@@ -107,29 +102,69 @@ class Plugin:
             tok  = norm.split()
             tset = set(tok)
             entry = {
-                "id": e["id"], "name": raw, "tvg_id": e["tvg_id"] or "",
+                "id":     e["id"],
+                "name":   raw,
+                "tvg_id": e["tvg_id"] or "",
                 "source": e["epg_source__name"] or "",
-                "norm": norm, "tok": tok, "tset": tset,
+                "norm":   norm,
+                "tok":    tok,
+                "tset":   tset,
             }
             m = _CTRY_RE.match(norm)
             if m:
                 by_country.setdefault(m.group(1), []).append(entry)
             else:
                 no_country.append(entry)
-        return by_country, no_country
+                # Index meaningful words
+                for word in tset:
+                    if len(word) >= 3 and word not in _STOP_WORDS:
+                        word_index.setdefault(word, []).append(entry)
 
-    def _suggest(self, ch_norm, by_country, no_country, cfg):
-        ct = ch_norm.split()
-        cs = set(ct)
-        m  = _CTRY_RE.match(ch_norm)
+        return by_country, no_country, word_index
+
+    def _candidates_for(self, ch_norm, ch_tok, ch_set, by_country, no_country, word_index):
+        """Return candidate EPG entries for this channel using word-index for no-prefix entries."""
+        m = _CTRY_RE.match(ch_norm)
+
+        # Country-prefixed entries: exact bucket lookup (fast)
+        country_entries = by_country.get(m.group(1), []) if m else []
+
+        # No-prefix entries: use word-index to find candidates sharing >= 1 meaningful word
+        meaningful = [w for w in ch_tok if len(w) >= 3 and w not in _STOP_WORDS and not w.isdigit()]
+        if meaningful:
+            seen = set()
+            nc_candidates = []
+            for word in meaningful:
+                for entry in word_index.get(word, []):
+                    eid = entry["id"]
+                    if eid not in seen:
+                        seen.add(eid)
+                        nc_candidates.append(entry)
+        else:
+            # No meaningful words — fall back to full no_country scan
+            nc_candidates = no_country
+
+        # If no country prefix on channel, also search all country buckets via word-index
+        if not m:
+            # Already have nc_candidates; add country-bucket hits via word-index
+            # (word_index only covers no_country; for country buckets do a small linear scan
+            #  but only buckets whose name contains a meaningful word)
+            seen_c = set()
+            for word in meaningful:
+                for country_list in by_country.values():
+                    for entry in country_list:
+                        if word in entry["tset"] and entry["id"] not in seen_c:
+                            seen_c.add(entry["id"])
+                            nc_candidates.append(entry)
+
+        return country_entries + nc_candidates
+
+    def _suggest(self, ch_norm, by_country, no_country, word_index, cfg):
+        ct    = ch_norm.split()
+        cs    = set(ct)
         min_s = cfg["min_s"]
 
-        if m:
-            # Country-prefixed: only compare against same country + no-prefix entries
-            candidates = by_country.get(m.group(1), []) + no_country
-        else:
-            # No prefix (provider stripped): compare against everything
-            candidates = no_country + [e for grp in by_country.values() for e in grp]
+        candidates = self._candidates_for(ch_norm, ct, cs, by_country, no_country, word_index)
 
         scored = []
         for e in candidates:
@@ -137,7 +172,16 @@ class Plugin:
             if s >= min_s:
                 scored.append((s, e))
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [dict(e, score=s) for s, e in scored[:cfg["max_n"]]]
+
+        # Deduplicate by id
+        seen, result = set(), []
+        for s, e in scored:
+            if e["id"] not in seen:
+                seen.add(e["id"])
+                result.append(dict(e, score=s))
+            if len(result) >= cfg["max_n"]:
+                break
+        return result
 
     def _get_channels(self, cfg, log):
         from apps.channels.models import Channel
@@ -157,6 +201,28 @@ class Plugin:
         log.info("EPG Suggester: %d EPG entries fetched", len(entries))
         return entries
 
+    def _run_matching(self, cfg, log):
+        channels               = self._get_channels(cfg, log)
+        epg_raw                = self._get_epg(cfg, log)
+        by_country, no_country, word_index = self._build_index(epg_raw, cfg)
+        log.info("EPG Suggester: index built (%d country groups, %d no-prefix, %d word-index keys)",
+                 len(by_country), len(no_country), len(word_index))
+        results = []
+        for ch in channels:
+            raw  = ch["name"] or ""
+            norm = self._norm(raw, cfg)
+            sugg = self._suggest(norm, by_country, no_country, word_index, cfg)
+            results.append({
+                "channel_id":    ch["id"],
+                "channel_name":  raw,
+                "channel_norm":  norm,
+                "channel_group": ch.get("channel_group__name") or "",
+                "suggestions":   sugg,
+            })
+        matched = sum(1 for r in results if r["suggestions"])
+        log.info("EPG Suggester: matching done. %d/%d matched", matched, len(results))
+        return results
+
     def _show_unmatched(self, cfg, log):
         from apps.channels.models import Channel
         qs = Channel.objects.select_related("channel_group").filter(epg_data__isnull=True)
@@ -175,36 +241,13 @@ class Plugin:
             lines.append("  id=" + str(c["id"]) + "  " + (c["name"] or ""))
         return "\n".join(lines)
 
-    def _run_matching(self, cfg, log):
-        """Core: fetch data, build index, run matching. Returns (channels, results)."""
-        channels   = self._get_channels(cfg, log)
-        epg_raw    = self._get_epg(cfg, log)
-        by_country, no_country = self._build_index(epg_raw, cfg)
-        log.info("EPG Suggester: index built (%d country groups, %d no-prefix)",
-                 len(by_country), len(no_country))
-        results = []
-        for ch in channels:
-            raw  = ch["name"] or ""
-            norm = self._norm(raw, cfg)
-            sugg = self._suggest(norm, by_country, no_country, cfg)
-            results.append({
-                "channel_id":   ch["id"],
-                "channel_name": raw,
-                "channel_norm": norm,
-                "channel_group": ch.get("channel_group__name") or "",
-                "suggestions":  sugg,
-            })
-        matched = sum(1 for r in results if r["suggestions"])
-        log.info("EPG Suggester: matching done. %d/%d matched", matched, len(results))
-        return results
-
     def _scan(self, cfg, log):
         import os
         from datetime import datetime
         results = self._run_matching(cfg, log)
         matched = sum(1 for r in results if r["suggestions"])
-        lines = ["EPG Suggester v2.0.0 - Scan Results",
-                 str(len(results)) + " channels without EPG  |  matched: " + str(matched), ""]
+        lines   = ["EPG Suggester v2.2.0 - Scan Results",
+                   str(len(results)) + " unmatched  |  suggestions found: " + str(matched), ""]
         for r in results:
             lines.append("---")
             lines.append("Channel: " + r["channel_name"] + "  [" + r["channel_group"] + "]")
@@ -236,11 +279,11 @@ class Plugin:
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = "/data/exports/epg_suggester_" + ts + ".csv"
         with open(path, "w", newline="", encoding="utf-8") as fh:
-            fh.write("# EPG Suggester v2.0.0 | " + datetime.now().isoformat() + "\n")
+            fh.write("# EPG Suggester v2.2.0 | " + datetime.now().isoformat() + "\n")
             fh.write("# min_score=" + str(cfg["min_s"]) + "  max_suggestions=" + str(cfg["max_n"]) + "\n#\n")
             w = csv.writer(fh)
-            w.writerow(["channel_id", "channel_name", "channel_norm", "channel_group",
-                        "rank", "score", "epg_name", "tvg_id", "epg_source", "epg_data_id"])
+            w.writerow(["channel_id","channel_name","channel_norm","channel_group",
+                        "rank","score","epg_name","tvg_id","epg_source","epg_data_id"])
             for r in results:
                 if r["suggestions"]:
                     for rank, s in enumerate(r["suggestions"], 1):
@@ -258,7 +301,7 @@ class Plugin:
         from apps.channels.models import Channel
         if not cfg["auto"]:
             return "Auto-Apply is DISABLED. Enable it in settings first."
-        results  = self._run_matching(cfg, log)
+        results = self._run_matching(cfg, log)
         applied = skipped = failed = 0
         for r in results:
             if not r["suggestions"] or r["suggestions"][0]["score"] < cfg["thresh"]:
