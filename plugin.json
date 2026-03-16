@@ -1,223 +1,113 @@
-class Plugin:
-    name = "EPG Suggester"
-    version = "1.9.0"
-    description = "Suggests EPG entries for channels without EPG assigned, using fuzzy name matching."
-
-    # Known 2-letter ISO country codes — prefixes matching these are kept during normalisation.
-    # Everything else (GO:, NOW:, VIP:, NBA:, PRIME:, DSTV:, SKY: etc.) is stripped.
-    COUNTRY_CODES = {
-        'us','uk','gb','au','ca','de','fr','it','es','nl','be','ch','at',
-        'no','se','dk','fi','pl','pt','ro','al','sr','hr','si','sk','cz',
-        'hu','rs','ba','me','mk','bg','gr','tr','il','ar','br','mx','nz',
-        'za','ie','is','lu','ee','lv','lt','ua','by','md','ge','am','az',
-        'kz','uz','pk','in','sg','my','th','ph','id','jp','kr','cn','hk',
-        'tw','ae','sa','qa','kw','bh','om','eg','ma','tn','dz','ly','ng',
-        'ke','gh','tz','et','cm','ci','sn','rw','ug','ao','mz',
+{
+  "name": "EPG Suggester",
+  "version": "1.2.0",
+  "description": "Scans channels without EPG assignments and suggests the best matching EPG entry based on fuzzy channel name matching. Strips IPTV prefixes (US|, UK:), quality tags (HD, 4K), and noise words (VIP, backup) before scoring.",
+  "author": "Jan Erik (custom)",
+  "help_url": "https://github.com/Dispatcharr/Dispatcharr/blob/main/Plugins.md",
+  "fields": [
+    {
+      "id": "min_score",
+      "label": "🎯 Minimum Match Score (0-100)",
+      "type": "number",
+      "default": 50,
+      "help_text": "Only suggest EPG entries scoring at or above this threshold. Lower = more suggestions but less accurate. Start at 50, raise to 70+ once results look good."
+    },
+    {
+      "id": "max_suggestions",
+      "label": "📋 Max Suggestions Per Channel",
+      "type": "number",
+      "default": 3,
+      "help_text": "Maximum number of EPG candidates to show per unmatched channel (1-10)."
+    },
+    {
+      "id": "epg_sources_filter",
+      "label": "📡 Limit to EPG Sources (optional)",
+      "type": "string",
+      "default": "",
+      "placeholder": "Source A, Source B",
+      "help_text": "Comma-separated EPG source names to search within. Leave blank to search all sources."
+    },
+    {
+      "id": "group_filter",
+      "label": "📂 Limit to Channel Groups (optional)",
+      "type": "string",
+      "default": "",
+      "placeholder": "US Channels, Sports",
+      "help_text": "Comma-separated channel group names to scan. Leave blank to scan all groups."
+    },
+    {
+      "id": "ignore_geo_prefixes",
+      "label": "🌍 Strip Geographic Prefixes (US|, UK:, USA: …)",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Remove country/region prefixes before matching so 'US| CNN' matches 'CNN'."
+    },
+    {
+      "id": "ignore_quality_tags",
+      "label": "🎬 Strip Quality Tags (HD, SD, 4K, FHD, UHD…)",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Remove quality suffixes/prefixes before matching so 'CNN HD' matches 'CNN'."
+    },
+    {
+      "id": "ignore_misc_tags",
+      "label": "🔧 Strip Misc Tags (vip, backup, +1…)",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Remove common IPTV noise words before matching."
+    },
+    {
+      "id": "auto_apply",
+      "label": "⚡ Auto-Apply Best Match (use with caution!)",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When enabled, 'Apply Best Suggestions' will actually write EPG assignments. Always review the CSV export first!"
+    },
+    {
+      "id": "auto_apply_threshold",
+      "label": "🔒 Auto-Apply Min Score (0-100)",
+      "type": "number",
+      "default": 85,
+      "help_text": "Safety floor for auto-apply. Only matches scoring at or above this will be assigned. Only used when Auto-Apply is enabled."
     }
-
-    def run(self, action, params, context):
-        import logging
-        log = logging.getLogger("plugins.epg_suggester")
-        settings = context.get("settings", {})
-        cfg = self._parse_settings(settings)
-        log.info("EPG Suggester: action=%s", action)
-
-        if action == "show_unmatched":
-            return self._show_unmatched(cfg, log)
-        elif action == "scan_and_suggest":
-            return self._scan(cfg, log)
-        elif action == "export_suggestions_csv":
-            return self._export(cfg, log)
-        elif action == "apply_suggestions":
-            return self._apply(cfg, log)
-        else:
-            return {"status": "error", "message": "Unknown action: " + action}
-
-    def _parse_settings(self, settings):
-        return {
-            "qual":   bool(settings.get("ignore_quality_tags", True)),
-            "misc":   bool(settings.get("ignore_misc_tags", True)),
-            "min_s":  max(0, min(100, int(settings.get("min_score", 60)))),
-            "max_n":  max(1, min(10,  int(settings.get("max_suggestions", 3)))),
-            "sf":     [x.strip() for x in settings.get("epg_sources_filter", "").split(",") if x.strip()],
-            "gf":     [x.strip() for x in settings.get("group_filter", "").split(",") if x.strip()],
-            "auto":   bool(settings.get("auto_apply", False)),
-            "thresh": max(0, min(100, int(settings.get("auto_apply_threshold", 85)))),
-        }
-
-    def _norm(self, name, cfg):
-        import re
-        n = name.strip()
-
-        # 1. Always strip Unicode superscript tags (ᴴᴰ ⱽᴵᴾ ᴿᴬᵂ ᶠᴴᴰ ᵁᴴᴰ etc.)
-        n = re.sub(r'[\u1d00-\u1dbf\u2c60-\u2c7f\u2070-\u209f\u00b2-\u00b3\u00b9]+', ' ', n)
-
-        # 2. Normalise prefix: keep country codes (no:, se:), strip providers (go:, now:, vip:)
-        m = re.match(r'^([A-Za-z]{2,5})\s*[|\-:]\s*', n)
-        if m:
-            prefix = m.group(1).lower()
-            rest = n[m.end():]
-            if prefix in self.COUNTRY_CODES:
-                n = prefix + ': ' + rest
-            else:
-                n = rest
-
-        # 3. Strip ASCII quality tags
-        if cfg["qual"]:
-            n = re.sub(r'\b(?:4k|uhd|fhd|hd|sd|hevc|h265|h264|hdr|sdr|1080[pi]?|720[pi]?)\b', ' ', n, flags=re.IGNORECASE)
-
-        # 4. Strip ASCII misc noise
-        if cfg["misc"]:
-            n = re.sub(r'\b(?:vip|backup\d*|bkup|plus|premium|extra|alt|raw|\+1|\+2)\b|\([^)]{0,15}\)|\[[^\]]{0,15}\]|\s*\*+\s*', ' ', n, flags=re.IGNORECASE)
-
-        return re.sub(r'\s+', ' ', n).strip().lower()
-
-    def _score(self, ch_norm, epg_norm):
-        import difflib, re
-
-        def _raw(a, b):
-            if a == b: return 100
-            s = int(difflib.SequenceMatcher(None, ' '.join(sorted(a.split())), ' '.join(sorted(b.split()))).ratio() * 90)
-            sa, sb = set(a.split()), set(b.split())
-            if sa and sb:
-                s = max(s, int(len(sa & sb) / max(len(sa), len(sb)) * 60))
-            if a in b or b in a:
-                s = min(99, s + 20)
-            return min(s, 99)
-
-        s = _raw(ch_norm, epg_norm)
-
-        # If channel has no country prefix but EPG does, also score against EPG without its prefix.
-        # This handles GO: CNN matching US: CNN (channel stripped to 'cnn', epg has 'us: cnn').
-        ch_has  = bool(re.match(r'^[a-z]{2,5}:\s', ch_norm))
-        epg_has = bool(re.match(r'^[a-z]{2,5}:\s', epg_norm))
-        if not ch_has and epg_has:
-            epg_stripped = re.sub(r'^[a-z]{2,5}:\s*', '', epg_norm)
-            s = max(s, _raw(ch_norm, epg_stripped))
-
-        return s
-
-    def _get_data(self, cfg, log):
-        from apps.channels.models import Channel
-        from apps.epg.models import EPGData
-        qs = Channel.objects.select_related("channel_group").filter(epg_data__isnull=True)
-        if cfg["gf"]:
-            qs = qs.filter(channel_group__name__in=cfg["gf"])
-        channels = list(qs.values("id", "name", "channel_group__name"))
-        log.info("EPG Suggester: %d unmatched channels", len(channels))
-        epg_qs = EPGData.objects.select_related("epg_source").values("id", "name", "tvg_id", "epg_source__name")
-        if cfg["sf"]:
-            epg_qs = epg_qs.filter(epg_source__name__in=cfg["sf"])
-        index = []
-        for e in epg_qs:
-            raw = (e["name"] or "").strip()
-            if raw:
-                index.append({"id": e["id"], "name": raw, "tvg_id": e["tvg_id"] or "",
-                               "source": e["epg_source__name"] or "", "norm": self._norm(raw, cfg)})
-        log.info("EPG Suggester: %d EPG entries in index", len(index))
-        return channels, index
-
-    def _suggest(self, ch_norm, index, cfg):
-        scored = [dict(e, score=self._score(ch_norm, e["norm"])) for e in index
-                  if self._score(ch_norm, e["norm"]) >= cfg["min_s"]]
-        scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:cfg["max_n"]]
-
-    def _show_unmatched(self, cfg, log):
-        from apps.channels.models import Channel
-        qs = Channel.objects.select_related("channel_group").filter(epg_data__isnull=True)
-        if cfg["gf"]:
-            qs = qs.filter(channel_group__name__in=cfg["gf"])
-        channels = list(qs.values("id", "name", "channel_group__name").order_by("channel_group__name", "name"))
-        if not channels:
-            return "All channels already have EPG assigned!"
-        lines = [str(len(channels)) + " channels without EPG:\n"]
-        grp = None
-        for c in channels:
-            g = c.get("channel_group__name") or "No Group"
-            if g != grp:
-                lines.append("\n[" + g + "]")
-                grp = g
-            lines.append("  id=" + str(c["id"]) + "  " + (c["name"] or ""))
-        return "\n".join(lines)
-
-    def _scan(self, cfg, log):
-        import os
-        from datetime import datetime
-        channels, index = self._get_data(cfg, log)
-        lines = ["EPG Suggester v1.9.0 - Scan Results", str(len(channels)) + " channels without EPG", ""]
-        matched = 0
-        for ch in channels:
-            raw = ch["name"] or ""
-            n = self._norm(raw, cfg)
-            sugg = self._suggest(n, index, cfg)
-            if sugg: matched += 1
-            lines.append("---")
-            lines.append("Channel: " + raw + "  [" + (ch.get("channel_group__name") or "") + "]")
-            lines.append("  norm: " + n)
-            if sugg:
-                for i, s in enumerate(sugg, 1):
-                    lines.append("  [" + str(i) + "] score=" + str(s["score"]) + "  " + s["name"] + "  source=" + s["source"] + "  id=" + str(s["id"]))
-            else:
-                lines.append("  No suggestions above score " + str(cfg["min_s"]))
-        lines += ["---", "Matched: " + str(matched) + " / " + str(len(channels))]
-        os.makedirs("/data/exports", exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out = "/data/exports/epg_suggester_scan_" + ts + ".txt"
-        with open(out, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-        log.info("EPG Suggester: scan done. %d/%d matched. Saved to %s", matched, len(channels), out)
-        preview = "\n".join(lines[:60])
-        if len(lines) > 60:
-            preview += "\n\n... full results in " + out
-        return preview
-
-    def _export(self, cfg, log):
-        import csv, os
-        from datetime import datetime
-        channels, index = self._get_data(cfg, log)
-        os.makedirs("/data/exports", exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = "/data/exports/epg_suggester_" + ts + ".csv"
-        matched = 0
-        with open(path, "w", newline="", encoding="utf-8") as fh:
-            fh.write("# EPG Suggester v1.9.0 | " + datetime.now().isoformat() + "\n")
-            fh.write("# min_score=" + str(cfg["min_s"]) + "  max_suggestions=" + str(cfg["max_n"]) + "\n#\n")
-            w = csv.writer(fh)
-            w.writerow(["channel_id", "channel_name", "channel_norm", "channel_group",
-                        "rank", "score", "epg_name", "tvg_id", "epg_source", "epg_data_id"])
-            for ch in channels:
-                raw = ch["name"] or ""
-                n = self._norm(raw, cfg)
-                sugg = self._suggest(n, index, cfg)
-                if sugg:
-                    matched += 1
-                    for rank, s in enumerate(sugg, 1):
-                        w.writerow([ch["id"], raw, n, ch.get("channel_group__name") or "",
-                                    rank, s["score"], s["name"], s["tvg_id"], s["source"], s["id"]])
-                else:
-                    w.writerow([ch["id"], raw, n, ch.get("channel_group__name") or "",
-                                "", "", "NO_MATCH", "", "", ""])
-        log.info("EPG Suggester: CSV saved to %s  (%d/%d matched)", path, matched, len(channels))
-        return "CSV saved to " + path + "\nMatched: " + str(matched) + " / " + str(len(channels)) + "\n\ndocker cp dispatcharr:" + path + " ./"
-
-    def _apply(self, cfg, log):
-        from apps.channels.models import Channel
-        if not cfg["auto"]:
-            return "Auto-Apply is DISABLED. Enable it in settings first."
-        channels, index = self._get_data(cfg, log)
-        applied = skipped = failed = 0
-        for ch in channels:
-            raw = ch["name"] or ""
-            sugg = self._suggest(self._norm(raw, cfg), index, cfg)
-            if not sugg or sugg[0]["score"] < cfg["thresh"]:
-                skipped += 1
-                continue
-            try:
-                Channel.objects.filter(pk=ch["id"]).update(epg_data_id=sugg[0]["id"])
-                log.info("EPG Suggester: APPLY  %s -> %s (score=%d)", raw, sugg[0]["name"], sugg[0]["score"])
-                applied += 1
-            except Exception as e:
-                log.error("EPG Suggester: FAIL  %s -> %s", raw, e)
-                failed += 1
-        return "Applied: " + str(applied) + "  Skipped: " + str(skipped) + "  Failed: " + str(failed)
+  ],
+  "actions": [
+    {
+      "id": "scan_and_suggest",
+      "label": "🔍 Scan & Suggest EPG",
+      "description": "Scan all channels without EPG assigned and suggest the best matching EPG entries. Results shown as a report.",
+      "button_label": "▶ Run Scan",
+      "button_variant": "filled",
+      "button_color": "blue"
+    },
+    {
+      "id": "export_suggestions_csv",
+      "label": "📤 Export Suggestions to CSV",
+      "description": "Run the suggestion scan and save full results to /data/exports/epg_suggester_TIMESTAMP.csv.",
+      "button_label": "💾 Export CSV",
+      "button_variant": "filled",
+      "button_color": "teal"
+    },
+    {
+      "id": "apply_suggestions",
+      "label": "✅ Apply Best Suggestions",
+      "description": "Assign the top EPG suggestion to each unmatched channel (only those above the auto-apply threshold). Requires 'Auto-Apply' to be enabled. Review the CSV export first!",
+      "button_label": "⚠ Apply Suggestions",
+      "button_variant": "filled",
+      "button_color": "orange",
+      "confirm": {
+        "required": true,
+        "title": "Apply EPG Suggestions?",
+        "message": "This will assign EPG data to unmatched channels. Make sure you have reviewed the CSV export first. Continue?"
+      }
+    },
+    {
+      "id": "show_unmatched",
+      "label": "📺 List Unmatched Channels",
+      "description": "Show a quick list of all channels that have no EPG assigned, without running the full suggestion engine.",
+      "button_label": "▶ List Unmatched",
+      "button_variant": "outline",
+      "button_color": "gray"
+    }
+  ]
+}
