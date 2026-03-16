@@ -4,5 +4,12 @@
   "version": "1.0",
   "author": "Plugin Developer",
   "description": "Scans channels without EPGs and suggests mappings based on channel names.",
-  "main": "plugin.py"
+  "main": "plugin.py",
+  "actions": [
+    {
+      "id": "suggest_epg",
+      "name": "Run EPG Suggestions",
+      "description": "Analyzes missing EPGs and suggests matching."
+    }
+  ]
 }
