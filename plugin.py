@@ -74,14 +74,18 @@ class Plugin:
     def _fast_score(ct, cs, cn, et, es, en, min_s):
         import difflib
         if cn == en: return 100
+        # Number guard: channels with different numbers are different channels
+        # e.g. "history 2" should NOT match "history 1"
+        ch_nums = set(t for t in ct if t.isdigit())
+        ep_nums = set(t for t in et if t.isdigit())
+        if ch_nums and ep_nums and not (ch_nums & ep_nums):
+            return 0
         inter = len(cs & es) if cs and es else 0
         union = max(len(cs), len(es)) if (cs or es) else 1
         overlap_s = int(inter / union * 90)
         sub = 20 if (cn in en or en in cn) else 0
-        # Early exit - can't reach min_s
         if overlap_s + sub < min_s:
             return overlap_s + sub
-        # SequenceMatcher only for promising candidates
         if overlap_s >= 40 or sub:
             ratio = difflib.SequenceMatcher(
                 None,
