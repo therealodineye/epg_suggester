@@ -24,7 +24,7 @@ _CALLSIGN_RE = _re.compile(r'\(([A-Z]{2,5}(?:-[A-Z0-9]+)?)\)')
 
 class Plugin:
     name        = "EPG Suggester"
-    version     = "2.2.0"
+    version     = "2.3.0"
     description = "Suggests EPG entries for channels without EPG assigned, using fuzzy name matching."
 
     def run(self, action, params, context):
