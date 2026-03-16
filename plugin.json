@@ -1,39 +1,16 @@
 {
   "name": "EPG Suggester",
-  "version": "1.0.0",
-  "description": "Scans channels without EPG assignments and intelligently suggests matching EPG sources based on channel name similarity. Strips IPTV prefixes, quality tags, and noise words to find the best match.",
+  "version": "1.2.0",
+  "description": "Scans channels without EPG assignments and suggests the best matching EPG entry based on fuzzy channel name matching. Strips IPTV prefixes (US|, UK:), quality tags (HD, 4K), and noise words (VIP, backup) before scoring.",
   "author": "Jan Erik (custom)",
   "help_url": "https://github.com/Dispatcharr/Dispatcharr/blob/main/Plugins.md",
   "fields": [
-    {
-      "id": "dispatcharr_url",
-      "label": "🌐 Dispatcharr URL",
-      "type": "string",
-      "default": "http://127.0.0.1:9191",
-      "placeholder": "http://127.0.0.1:9191",
-      "help_text": "Full URL to your Dispatcharr instance (e.g. http://192.168.1.10:9191). Used for API calls."
-    },
-    {
-      "id": "username",
-      "label": "👤 Admin Username",
-      "type": "string",
-      "default": "admin",
-      "help_text": "Dispatcharr admin username for API authentication."
-    },
-    {
-      "id": "password",
-      "label": "🔑 Admin Password",
-      "type": "string",
-      "input_type": "password",
-      "default": "",
-      "help_text": "Dispatcharr admin password for API authentication."
-    },
     {
       "id": "min_score",
       "label": "🎯 Minimum Match Score (0-100)",
       "type": "number",
       "default": 50,
-      "help_text": "Only suggest EPG entries scoring at or above this threshold. Lower = more suggestions but less accurate. Recommended: 50-70."
+      "help_text": "Only suggest EPG entries scoring at or above this threshold. Lower = more suggestions but less accurate. Start at 50, raise to 70+ once results look good."
     },
     {
       "id": "max_suggestions",
@@ -59,6 +36,13 @@
       "help_text": "Comma-separated channel group names to scan. Leave blank to scan all groups."
     },
     {
+      "id": "ignore_geo_prefixes",
+      "label": "🌍 Strip Geographic Prefixes (US|, UK:, USA: …)",
+      "type": "boolean",
+      "default": true,
+      "help_text": "Remove country/region prefixes before matching so 'US| CNN' matches 'CNN'."
+    },
+    {
       "id": "ignore_quality_tags",
       "label": "🎬 Strip Quality Tags (HD, SD, 4K, FHD, UHD…)",
       "type": "boolean",
@@ -66,47 +50,40 @@
       "help_text": "Remove quality suffixes/prefixes before matching so 'CNN HD' matches 'CNN'."
     },
     {
-      "id": "ignore_geo_prefixes",
-      "label": "🌍 Strip Geographic Prefixes (US|, USA:, UK| …)",
-      "type": "boolean",
-      "default": true,
-      "help_text": "Remove country/region prefixes before matching so 'US| CNN' matches 'CNN'."
-    },
-    {
       "id": "ignore_misc_tags",
-      "label": "🔧 Strip Misc Tags (vip, backup, (A), +1 …)",
+      "label": "🔧 Strip Misc Tags (vip, backup, +1…)",
       "type": "boolean",
       "default": true,
       "help_text": "Remove common IPTV noise words before matching."
     },
     {
       "id": "auto_apply",
-      "label": "⚡ Auto-Apply Best Match (dangerous!)",
+      "label": "⚡ Auto-Apply Best Match (use with caution!)",
       "type": "boolean",
       "default": false,
-      "help_text": "If enabled, automatically assign the top-scoring EPG suggestion when its score meets the minimum threshold. Disable to preview-only mode first."
+      "help_text": "When enabled, 'Apply Best Suggestions' will actually write EPG assignments. Always review the CSV export first!"
     },
     {
       "id": "auto_apply_threshold",
-      "label": "🔒 Auto-Apply Min Score Override (0-100)",
+      "label": "🔒 Auto-Apply Min Score (0-100)",
       "type": "number",
       "default": 85,
-      "help_text": "Only auto-apply matches at or above this score. Acts as a safety guard. Only used when Auto-Apply is enabled."
+      "help_text": "Safety floor for auto-apply. Only matches scoring at or above this will be assigned. Only used when Auto-Apply is enabled."
     }
   ],
   "actions": [
     {
       "id": "scan_and_suggest",
       "label": "🔍 Scan & Suggest EPG",
-      "description": "Scan all channels without EPG assigned and suggest the best matching EPG entries based on fuzzy name matching. Results shown as a text report.",
-      "button_label": "▶ Run Scan & Suggest",
+      "description": "Scan all channels without EPG assigned and suggest the best matching EPG entries. Results shown as a report.",
+      "button_label": "▶ Run Scan",
       "button_variant": "filled",
       "button_color": "blue"
     },
     {
       "id": "export_suggestions_csv",
       "label": "📤 Export Suggestions to CSV",
-      "description": "Run the suggestion scan and save results to /data/epg_suggester_results.csv for review.",
+      "description": "Run the suggestion scan and save full results to /data/exports/epg_suggester_TIMESTAMP.csv.",
       "button_label": "💾 Export CSV",
       "button_variant": "filled",
       "button_color": "teal"
@@ -114,11 +91,15 @@
     {
       "id": "apply_suggestions",
       "label": "✅ Apply Best Suggestions",
-      "description": "Apply the top EPG suggestion (above the auto-apply threshold) to all unmatched channels. Requires 'Auto-Apply Best Match' to be enabled in settings. ALWAYS export and review CSV first!",
+      "description": "Assign the top EPG suggestion to each unmatched channel (only those above the auto-apply threshold). Requires 'Auto-Apply' to be enabled. Review the CSV export first!",
       "button_label": "⚠ Apply Suggestions",
       "button_variant": "filled",
       "button_color": "orange",
-      "confirm": true
+      "confirm": {
+        "required": true,
+        "title": "Apply EPG Suggestions?",
+        "message": "This will assign EPG data to unmatched channels. Make sure you have reviewed the CSV export first. Continue?"
+      }
     },
     {
       "id": "show_unmatched",
