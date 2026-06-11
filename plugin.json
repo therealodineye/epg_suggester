@@ -1,6 +1,6 @@
 {
   "name": "EPG Suggester",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "Scans channels without EPG assignments and suggests the best matching EPG entry based on fuzzy channel name matching. Strips IPTV prefixes (US|, UK:), quality tags (HD, 4K), and noise words (VIP, backup) before scoring. Supports callsign matching, source priority, auto-apply with rollback, dry-run preview, CSV export/import workflow, and audit of already-matched channels.",
   "author": "Jan Erik (custom)",
   "help_url": "https://github.com/Dispatcharr/Dispatcharr/blob/main/Plugins.md",
